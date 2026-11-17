@@ -1,0 +1,20 @@
+{
+  "duration": 30,
+  "photos": [
+    {"path": "photos/01.jpg", "focus_x": 0.5, "focus_y": 0.45},
+    {"path": "photos/02.jpg", "focus_x": 0.5, "focus_y": 0.5},
+    {"path": "photos/03.jpg", "focus_x": 0.5, "focus_y": 0.55}
+  ],
+  "audio": "music.m4a",
+  "effects": {"stars_opacity": 0.85, "wave_opacity": 0.22},
+  "lines": [
+    {"text": "谢 幕 答 谢", "heading": true},
+    {"text": "2026.10.01"},
+    {"text": ""},
+    {"text": "新郎 张三  &  新娘 李四"},
+    {"text": "感谢你们，奔赴这场相聚"},
+    {"text": "亲友团", "heading": true},
+    {"names": ["王小明", "赵小红", "陈大伟", "刘芳", "周杰", "吴倩"]},
+    {"text": "感谢你们，见证我们的幸福"}
+  ]
+}
