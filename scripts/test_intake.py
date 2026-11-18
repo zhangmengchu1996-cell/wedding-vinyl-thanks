@@ -5,6 +5,7 @@ These are local script tests. They are not a Codex or WorkBuddy conversation.
 import hashlib, json, subprocess, sys, tempfile, unittest, zipfile
 from pathlib import Path
 
+from check_environment import locate_tool, probe_executable
 from gate import (
     ORIGINAL_REFERENCE,
     GateError,
@@ -82,7 +83,8 @@ class DecisionTests(unittest.TestCase):
             })
             self.assertFalse(decision["render"], phrase)
             self.assertEqual(decision["action"], "ask_photos", phrase)
-            self.assertEqual(decision["tell_user"], "请先发你自己的照片。")
+            self.assertIn("请发要放进唱片里的照片", decision["tell_user"])
+            self.assertFalse(decision["preview_allowed"])
             self.assertIn("不是同意", decision["assistant_note"])
             self.assertNotIn("你挑一个", decision["tell_user"])
             self.assertTrue(is_vague_request(phrase))
@@ -96,14 +98,115 @@ class DecisionTests(unittest.TestCase):
         decision = decide(full_state(
             names=False, date=False, lists=False, thanks=False, audio=False, audio_label="",
         ))
-        self.assertEqual(decision["action"], "ask_copy")
-        self.assertEqual(decision["missing_copy"], ["names", "date", "lists", "thanks"])
+        self.assertEqual(decision["action"], "ask_identity")
+        self.assertEqual(decision["ask"], "identity")
+        self.assertIn("姓名和日期", decision["tell_user"])
+        self.assertNotIn("分组名单", decision["tell_user"])
         self.assertFalse(decision["render"])
 
     def test_partial_copy_asks_only_for_the_missing_part(self):
         decision = decide(full_state(lists=False, thanks=False, audio=False, audio_label=""))
-        self.assertEqual(decision["missing_copy"], ["lists", "thanks"])
+        self.assertEqual(decision["action"], "ask_lists")
+        self.assertIn("分组名单", decision["tell_user"])
+        self.assertNotIn("致谢", decision["tell_user"])
         self.assertFalse(decision["render"])
+
+    def test_normal_request_asks_for_photos_and_does_not_preview(self):
+        decision = decide({
+            "intent": "personal",
+            "utterance": "帮我用这个技能包一步步做出婚礼致谢视频",
+        })
+        self.assertEqual(decision["action"], "ask_photos")
+        self.assertIn("请发要放进唱片里的照片", decision["tell_user"])
+        self.assertFalse(decision["render"])
+        self.assertFalse(decision["preview_allowed"])
+        self.assertNotIn("通用效果预览", decision["tell_user"])
+
+    def test_explicit_preview_is_labeled_and_names_the_next_step(self):
+        decision = decide({"intent": "personal", "utterance": "先看一下效果"})
+        self.assertEqual(decision["action"], "make_labeled_preview")
+        self.assertTrue(decision["preview_allowed"])
+        self.assertFalse(decision["formal_render"])
+        self.assertEqual(decision["tell_user"], (
+            "这是通用效果预览，还不是你们的正式版。接下来先换照片，请发要放进唱片里的照片；不知道怎么选可以先发几张，我帮你挑。"
+        ))
+
+    def test_after_preview_with_photos_asks_for_names_not_photos_again(self):
+        decision = decide(full_state(
+            utterance="预览看过了",
+            preview_delivered=True,
+            names=False, date=False, lists=False, thanks=False, audio=False, audio_label="",
+        ))
+        self.assertEqual(decision["action"], "ask_identity")
+        self.assertNotIn("通用效果预览", decision["tell_user"])
+        self.assertNotIn("照片", decision["tell_user"])
+
+    def test_out_of_order_materials_ask_the_earliest_gap(self):
+        decision = decide({
+            "intent": "personal",
+            "utterance": "名单和音乐我先发了",
+            "lists": True,
+            "audio": True,
+            "audio_label": "march.m4a",
+        })
+        self.assertEqual(decision["action"], "ask_photos")
+        self.assertNotIn("分组名单", decision["tell_user"])
+        self.assertFalse(decision["render"])
+
+    def test_everything_at_once_goes_to_confirmation(self):
+        decision = decide(full_state(confirmed=False))
+        self.assertEqual(decision["action"], "confirm_before_render")
+        self.assertIn("march.m4a", decision["summary"])
+        self.assertFalse(decision["render"])
+
+    def test_consult_does_not_render_and_still_gives_one_step(self):
+        decision = decide({"intent": "consult", "utterance": "只是问问怎么做"})
+        self.assertEqual(decision["action"], "consult")
+        self.assertFalse(decision["render"])
+        self.assertIn("请发要放进唱片里的照片", decision["tell_user"])
+
+    def test_missing_tools_still_ask_for_photos(self):
+        decision = decide({
+            "intent": "personal",
+            "utterance": "帮我用这个技能包一步步做出婚礼致谢视频",
+            "ffmpeg_available": False,
+            "tool_status": "not_found",
+        })
+        self.assertEqual(decision["action"], "tools_blocked")
+        self.assertFalse(decision["render"])
+        self.assertIn("暂时不能导出", decision["tell_user"])
+        self.assertIn("请发要放进唱片里的照片", decision["tell_user"])
+        self.assertIn("同意", decision["tell_user"])
+        self.assertNotIn("系统拦住", decision["tell_user"])
+        self.assertNotIn("Homebrew", decision["tell_user"])
+        self.assertNotIn("装好再来", decision["tell_user"])
+
+    def test_crash_without_a_log_is_not_called_a_system_block(self):
+        decision = decide({
+            "intent": "personal",
+            "utterance": "帮我做视频",
+            "ffmpeg_available": False,
+            "tool_status": "crashed",
+        })
+        self.assertIn("不能说是系统拦住", decision["tell_user"])
+        self.assertIn("照片", decision["tell_user"])
+        self.assertFalse(decision["render"])
+
+    def test_sandbox_limit_is_not_blamed_on_the_user_machine(self):
+        decision = decide({
+            "intent": "personal",
+            "utterance": "帮我做视频",
+            "ffmpeg_available": False,
+            "sandbox_limited": True,
+        })
+        self.assertIn("不要把它说成你的电脑没装", decision["tell_user"])
+        self.assertIn("照片", decision["tell_user"])
+
+    def test_formal_delivery_does_not_ask_again(self):
+        decision = decide(full_state(delivered=True, confirmed=True))
+        self.assertEqual(decision["action"], "done")
+        self.assertFalse(decision["render"])
+        self.assertIn("不用再发", decision["tell_user"])
 
     def test_photos_and_copy_without_music_asks_for_bgm(self):
         decision = decide(full_state(utterance="照片和文字都齐了", audio=False, audio_label=""))
@@ -492,6 +595,18 @@ class FfmpegAndDocTests(unittest.TestCase):
         source = (ROOT / "scripts" / "check_environment.py").read_text(encoding="utf-8")
         for banned in ("codesign", "xattr", "com.apple.quarantine", "spctl"):
             self.assertNotIn(banned, source)
+        missing = probe_executable("/no/such/ffmpeg-binary")
+        self.assertEqual(missing["status"], "not_found")
+        self.assertFalse(missing["assert_system_block"])
+        with tempfile.TemporaryDirectory() as tmp:
+            blocked = Path(tmp) / "ffmpeg"
+            blocked.write_text("not a binary", encoding="utf-8")
+            blocked.chmod(0o644)
+            denied = probe_executable(blocked)
+            self.assertEqual(denied["status"], "not_executable")
+        live = locate_tool("ffmpeg")
+        self.assertEqual(live["status"], "ok")
+        self.assertIn("version", live["version"].lower())
 
     def test_docs_and_metadata(self):
         codex = (ROOT / "SKILL.md").read_text(encoding="utf-8")

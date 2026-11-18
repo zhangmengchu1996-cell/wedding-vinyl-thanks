@@ -13,7 +13,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 ASSETS = ROOT / "assets"
 EXAMPLES = ROOT / "examples"
-GATE_VERSION = "0.2.2"
+GATE_VERSION = "0.2.3"
 
 VAGUE_EXACT = {
     "给我跑一下", "跑一下", "试一下", "做一个", "做一下", "试试看",
@@ -158,6 +158,22 @@ def mentions_other_song(text):
     raw = text or ""
     return any(item in raw for item in ("别的歌", "不是这首", "另一首", "换一首"))
 
+PREVIEW_MARKERS = ("效果预览", "通用预览", "看效果", "看看效果", "先看一下效果", "先看预览")
+CONSULT_MARKERS = ("只是问问", "先不导出", "先别做", "只咨询", "先别渲染")
+PREVIEW_CLOSE = "这是通用效果预览，还不是你们的正式版。接下来先换照片，请发要放进唱片里的照片；不知道怎么选可以先发几张，我帮你挑。"
+
+def wants_preview(text, intent=""):
+    if intent == "preview":
+        return True
+    raw = text or ""
+    return any(marker in raw for marker in PREVIEW_MARKERS)
+
+def is_consult(text, intent=""):
+    if intent == "consult":
+        return True
+    raw = text or ""
+    return any(marker in raw for marker in CONSULT_MARKERS)
+
 def mentions_own_song(text, choice=""):
     if choice in ("own", "自己选歌"):
         return True
@@ -180,6 +196,64 @@ def canonical_summary(photo_count, kind, audio_label, placeholders, width, sourc
     parts.append(f"确认后才导出 {width}×{width * 9 // 16}")
     return "；".join(parts) + "。"
 
+def next_gap(state):
+    """One current gap. Already supplied steps are skipped, even if later ones arrived first."""
+    if not state.get("photos"):
+        return "photos"
+    if not state.get("names") and not state.get("date"):
+        return "identity"
+    if not state.get("names"):
+        return "names"
+    if not state.get("date"):
+        return "date"
+    if not state.get("lists"):
+        return "lists"
+    if not state.get("thanks"):
+        return "thanks"
+    return "audio"
+
+def gap_message(gap):
+    if gap == "photos":
+        return "请发要放进唱片里的照片。不知道怎么选可以先发几张，我帮你挑。"
+    if gap == "identity":
+        return "请发新人的姓名和日期。"
+    if gap == "names":
+        return "日期已记下。请发新人的姓名。"
+    if gap == "date":
+        return "姓名已记下。请发日期。"
+    if gap == "lists":
+        return "请发分组名单。我可以帮你整理，你核对后再用。"
+    if gap == "thanks":
+        return "请发想出现的致谢文案。还没想好的话，我可以先写一版给你确认。"
+    return ""
+
+def preview_message(gap):
+    if gap == "photos":
+        return PREVIEW_CLOSE
+    return "这是通用效果预览，还不是你们的正式版。接下来" + gap_message(gap)
+
+def tools_message(state, gap):
+    status = state.get("tool_status") or ""
+    if state.get("sandbox_limited"):
+        lead = "当前这个环境启动不了 FFmpeg，所以暂时不能导出。不要把它说成你的电脑没装。"
+        extra = ""
+    elif status == "not_found":
+        lead = "这里还没找到能运行的 FFmpeg，所以暂时不能导出。"
+        extra = "如果你愿意，我可以在你同意后按官网方式协助安装。"
+    elif status == "not_executable":
+        lead = "找到了 FFmpeg，但现在执行不了，所以暂时不能导出。"
+        extra = ""
+    elif status == "permission":
+        lead = "找到了 FFmpeg，但当前环境没有运行权限，所以暂时不能导出。"
+        extra = ""
+    elif status == "crashed":
+        lead = "FFmpeg 实际运行没有成功，所以暂时不能导出。没有运行日志时，不能说是系统拦住了它。"
+        extra = ""
+    else:
+        lead = "这里暂时不能导出。"
+        extra = ""
+    return lead + extra + "我不会换别的软件，也不会改系统设置。" + gap_message(gap)
+
 def decide(state):
     if not isinstance(state, dict):
         raise GateError("state 必须是对象")
@@ -196,6 +270,42 @@ def decide(state):
         "agent_flags_are_not_a_security_boundary": True,
         "vague_phrase_is_not_consent": True,
     }
+    gap = next_gap(state)
+    tools_blocked = state.get("ffmpeg_available") is False or state.get("tools_blocked") is True
+
+    if state.get("delivered"):
+        return _result(
+            "done",
+            "正式版已经交给你了。已经收到的照片、文字和音乐不用再发。",
+            ask=None,
+            limits=limits,
+            assistant_note="不要再索要已经收过的材料。",
+        )
+    if tools_blocked:
+        return _result(
+            "tools_blocked",
+            tools_message(state, gap),
+            ask=gap,
+            limits=limits,
+            assistant_note="不要静默换渲染引擎，不要降效果，不要改隔离、签名或系统依赖。仍可继续收当前这一项。",
+        )
+    if is_consult(text, intent):
+        return _result(
+            "consult",
+            "先不导出。" + gap_message(gap),
+            ask=gap,
+            limits=limits,
+            assistant_note="只回答问题，不渲染。",
+        )
+    if wants_preview(text, intent) and not state.get("preview_delivered"):
+        return _result(
+            "make_labeled_preview",
+            preview_message(gap),
+            ask=gap,
+            limits=limits,
+            assistant_note="只在用户明确要看效果时做一次通用预览。不要用喜字或示例名单冒充用户的照片和亲友。没有音乐就明说这段预览没有配乐，不要擅自静音却不说，也不要合成测试音。",
+            preview_allowed=True,
+        )
 
     if (intent == "install" or is_install_request(text)) and not vague and not provided:
         if state.get("already_installed"):
@@ -208,32 +318,16 @@ def decide(state):
             limits=limits,
             assistant_note="只做只读依赖检查。不要重报版本，不要念路径，不要给安装、打补丁或出片的选择。",
         )
-    if vague and not photos:
+    if gap != "audio":
+        note = ""
+        if vague:
+            note = "「给我跑一下」「试一下」「做一个」不是同意通用预览，也不是同意静音或合成测试音。"
         return _result(
-            "ask_photos",
-            "请先发你自己的照片。",
-            ask="photos",
+            "ask_" + gap,
+            gap_message(gap),
+            ask=gap,
             limits=limits,
-            assistant_note="「给我跑一下」「试一下」「做一个」不是同意占位演示，也不是同意合成测试音。不要提供技术试跑菜单。",
-        )
-    if not photos:
-        return _result(
-            "ask_photos",
-            "请先发你要放进视频的照片。",
-            ask="photos",
-            limits=limits,
-        )
-    missing = [key for key in COPY_FIELDS if not copy[key]]
-    if missing:
-        got = [COPY_LABELS[key] for key in COPY_FIELDS if copy[key]]
-        prefix = ("已记下" + "、".join(got) + "。") if got else "照片已收到。"
-        need = "、".join(COPY_LABELS[key] for key in missing)
-        return _result(
-            "ask_copy",
-            prefix + "请再发" + need + "。名单请自己核对，我不会猜名字，也不会用示例化名。",
-            ask="copy",
-            missing_copy=missing,
-            limits=limits,
+            assistant_note=note,
         )
     choice = state.get("music_choice") or ""
     source_video = (state.get("source_video") or "").strip()
@@ -325,7 +419,7 @@ def _audio_kind(state, audio, audio_label):
         return "synthetic-test-tone"
     return "need-audio"
 
-def _result(action, tell, ask=None, summary=None, missing_copy=None, limits=None, assistant_note=""):
+def _result(action, tell, ask=None, summary=None, missing_copy=None, limits=None, assistant_note="", preview_allowed=False):
     return {
         "action": action,
         "render": action in ("render", "render_silent", "render_synthetic"),
@@ -337,6 +431,8 @@ def _result(action, tell, ask=None, summary=None, missing_copy=None, limits=None
         "limits": limits,
         "show_technical_details": False,
         "offer_choice_menu": False,
+        "preview_allowed": bool(preview_allowed),
+        "formal_render": action in ("render", "render_silent", "render_synthetic"),
         "gate_version": GATE_VERSION,
     }
 

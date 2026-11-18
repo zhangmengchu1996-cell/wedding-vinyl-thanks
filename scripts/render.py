@@ -26,11 +26,11 @@ def png(path,w,h,pixel):
     path.write_bytes(b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>2I5B',w,h,8,6,0,0,0))+chunk(b'IDAT',zlib.compress(data))+chunk(b'IEND',b''))
 
 def binary(name):
-    v=os.environ.get(name.upper()) or shutil.which(name)
-    if v:return v
-    p=Path('/Applications/ChatCut.app/Contents/Resources/app.asar.unpacked/node_modules/ffmpeg-ffprobe-static')/name
-    if p.exists():return str(p)
-    raise ValueError('找不到 '+name+'；请安装或设置 '+name.upper())
+    from check_environment import locate_tool, tool_status_text
+    found = locate_tool(name)
+    if found["status"] == "ok":
+        return found["path"]
+    raise ValueError(tool_status_text(found) + "。不要改用别的渲染软件。")
 
 def require_tool(name):
     try:
