@@ -20,7 +20,8 @@ VAGUE_EXACT = {
     "帮我跑一下", "帮我试一下", "测试一下", "跑个测试", "跑一下看看",
 }
 INSTALL_EXACT = {"安装好了", "已安装", "技能已安装", "装好了", "我装好了"}
-SILENCE_MARKERS = ("不要音乐", "先静音", "跳过音乐", "不用音乐", "明确不要音乐")
+SILENCE_MARKERS = ("不要音乐", "先静音", "跳过音乐", "不用音乐", "明确不要音乐", "明确静音")
+ORIGINAL_REFERENCE = "五月天《如果我们不曾相遇》"
 COPY_FIELDS = ("names", "date", "lists", "thanks")
 COPY_LABELS = {
     "names": "新郎新娘姓名",
@@ -140,7 +141,25 @@ def synthetic_allowed(state):
         return False
     return "合成测试音" in text and "同意" in text and state.get("synthetic_tone_accepted") is True
 
-def canonical_summary(photo_count, kind, audio_label, placeholders, width):
+def mentions_original(text, choice=""):
+    if choice in ("original", "原片同款"):
+        return True
+    raw = text or ""
+    if "原片同款" in raw or "如果我们不曾相遇" in raw:
+        return True
+    compact = normalize(raw)
+    return compact in {"用原片", "原片", "原片音乐", "原片的音乐", "用原片的音乐", "用原片的bgm", "用原片的BGM"}
+
+def mentions_other_song(text):
+    raw = text or ""
+    return any(item in raw for item in ("别的歌", "不是这首", "另一首", "换一首"))
+
+def mentions_own_song(text, choice=""):
+    if choice in ("own", "自己选歌"):
+        return True
+    return "自己选歌" in (text or "")
+
+def canonical_summary(photo_count, kind, audio_label, placeholders, width, source_note=""):
     parts = [f"照片 {photo_count} 张", "姓名、婚期、分组名单和感谢文字已收到"]
     if placeholders:
         parts.append("这是占位照片和化名，不是你的婚礼")
@@ -149,7 +168,11 @@ def canonical_summary(photo_count, kind, audio_label, placeholders, width):
     elif kind == "synthetic-test-tone":
         parts.append("音乐是合成测试音，不是你的歌曲")
     else:
+        if not audio_label:
+            raise GateError("确认前必须有真实音乐文件名。不能只写原片同款。")
         parts.append("音乐文件：" + audio_label)
+        if source_note:
+            parts.append(source_note)
     parts.append(f"确认后才导出 {width}×{width * 9 // 16}")
     return "；".join(parts) + "。"
 
@@ -208,13 +231,47 @@ def decide(state):
             missing_copy=missing,
             limits=limits,
         )
+    choice = state.get("music_choice") or ""
+    source_video = (state.get("source_video") or "").strip()
     kind = _audio_kind(state, audio, audio_label)
     if kind == "need-audio":
+        if mentions_other_song(text):
+            return _result(
+                "ask_audio",
+                f"原片同款指的是{ORIGINAL_REFERENCE}。你要的如果是别的音乐，请告诉我是哪一首，或直接发文件。",
+                ask="audio",
+                limits=limits,
+                assistant_note="不要猜测私人视频路径，也不要下载。",
+            )
+        if mentions_original(text, choice):
+            if source_video and "同意提取" in text:
+                return _result(
+                    "extract_audio",
+                    "可以按你的明确要求，从你给出的这段本地视频里提取整条音轨。里面如果有人声或环境声，会一起留下。这一步只是取出声音，不代表已经获得歌曲版权。",
+                    ask="audio",
+                    limits=limits,
+                    assistant_note="只处理用户给出的这个文件。不要从技能包素材里取，也不要去网上找。",
+                )
+            return _result(
+                "ask_original_file",
+                f"好，用原片同款：{ORIGINAL_REFERENCE}。请上传你有权使用的音频；或者发一段含有这段配乐的本地视频，并说明同意提取。包里没有这首歌，我也不会去网上找。",
+                ask="audio",
+                limits=limits,
+                assistant_note="曲名只是参考。选择同款不等于已经有文件或授权。不要猜测私人视频路径。",
+            )
+        if mentions_own_song(text, choice) or "音乐用" in text:
+            return _result(
+                "ask_audio",
+                "请把音乐文件发过来。",
+                ask="audio",
+                limits=limits,
+            )
         return _result(
             "ask_audio",
-            "请发音乐文件。确定不要音乐的话，直接说「不要音乐」。",
+            f"音乐可以用：原片同款、自己选歌，或明确静音。原片同款指{ORIGINAL_REFERENCE}，包里没有这首歌。",
             ask="audio",
             limits=limits,
+            assistant_note="这是音乐内容的三个短选项，不是安装或打补丁菜单。",
         )
     if kind == "conflict":
         return _result(
@@ -233,12 +290,15 @@ def decide(state):
         )
     if kind == "file" and not audio_label:
         raise GateError("已有音乐文件时需要 audio_label，确认前要向用户报出文件名")
+    if kind == "file" and mentions_original(text, choice) and not state.get("audio_source"):
+        state["audio_source"] = f"参考曲目是{ORIGINAL_REFERENCE}。曲名不是授权，实际使用的是这个文件。"
     summary = canonical_summary(
         int(state.get("photo_count") or 1),
         kind,
         audio_label,
         placeholders_allowed(state),
         int(state.get("width") or 1920),
+        state.get("audio_source") or "",
     )
     if not confirmed:
         return _result("confirm_before_render", "导出前请确认：" + summary, summary=summary, limits=limits)
@@ -372,6 +432,14 @@ def build_manifest(state, config_path, out_dir, manifest_path, width=1920):
         state["audio"] = True
         state["audio_label"] = audio.name
         state["synthetic_tone_accepted"] = False
+        if not state.get("audio_source") and mentions_original(state.get("utterance") or "", state.get("music_choice") or ""):
+            state["audio_source"] = f"参考曲目是{ORIGINAL_REFERENCE}。曲名不是授权，实际使用的是这个文件。"
+        audio_from = cfg.get("audio_from")
+        if isinstance(audio_from, str) and audio_from.strip():
+            state["audio_source"] = (
+                f"来源：从你要求提取的视频 {Path(audio_from).name} 取出的整条音轨。"
+                "这只是技术提取，不是版权证明。"
+            )
     elif kind == "silent":
         state["audio"] = False
         state["audio_label"] = ""
@@ -410,6 +478,8 @@ def build_manifest(state, config_path, out_dir, manifest_path, width=1920):
         "config_sha256": sha256_file(config_path),
         "output_dir": str(out_dir),
         "photos": [{"path": str(path), "sha256": sha256_file(path)} for path in photos],
+        "audio_source": state.get("audio_source") or "",
+        "reference_track": ORIGINAL_REFERENCE if mentions_original(state.get("utterance") or "", state.get("music_choice") or "") else "",
         "audio": None if audio is None else {"path": str(audio), "sha256": sha256_file(audio), "kind": kind},
         "ffmpeg": {
             "version": version_line,
@@ -467,6 +537,7 @@ def assert_manifest(manifest_path, config_path, out_dir, width):
         "thanks": True,
         "audio": kind == "file" or kind == "synthetic-test-tone",
         "audio_label": Path(audio).name if audio is not None else "",
+        "audio_source": manifest.get("audio_source") or "",
         "confirmed": True,
         "placeholders_accepted": bool(manifest.get("placeholders")),
         "synthetic_tone_accepted": kind == "synthetic-test-tone",
@@ -477,6 +548,34 @@ def assert_manifest(manifest_path, config_path, out_dir, width):
     if not decision["render"] or decision.get("summary") != manifest.get("summary"):
         raise GateError("清单和当前规则不一致。已停止。请重新确认。")
     return manifest, photos, kind, audio
+
+def extract_user_audio(video, dest, utterance):
+    """Copy the whole audio track from a user-supplied local video. Not a license."""
+    if "同意提取" not in (utterance or ""):
+        raise GateError("还没有明确要求提取。已停止。从视频取出声音不会自动获得歌曲版权。")
+    video = Path(video).expanduser()
+    if not video.is_absolute():
+        video = Path.cwd() / video
+    video = video.resolve()
+    if not video.is_file():
+        raise GateError(f"找不到你给出的视频：{video}。已停止，没有改去找别的文件。")
+    if inside(video, EXAMPLES) or inside(video, ASSETS):
+        raise GateError("不能从技能包的示例或效果素材里提取音频。已停止。")
+    if not has_stream(video, "audio"):
+        raise GateError(f"这条视频没有音轨：{video.name}。已停止，没有改成静音。")
+    dest = Path(dest)
+    if inside(dest, EXAMPLES) or inside(dest, ASSETS):
+        raise GateError("提取结果不能写进技能包。")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    ff = _binary("ffmpeg")
+    result = subprocess.run(
+        [ff, "-y", "-hide_banner", "-loglevel", "error", "-i", str(video), "-vn", "-c:a", "aac", str(dest)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    if result.returncode or not dest.is_file() or not has_stream(dest, "audio"):
+        raise GateError("没有从这段视频里取出音轨。已停止，没有改成静音。" + (result.stderr or "")[-300:])
+    note = "提取的是整条音轨。若有人声或环境声会一起留下，这里不会拆成纯音乐。这一步只是技术提取，不构成歌曲授权。"
+    return {"path": str(dest.resolve()), "source": video.name, "note": note}
 
 def write_test_tone(state, dest):
     dest = Path(dest)
@@ -503,7 +602,8 @@ def _read_json(path):
 
 def main():
     parser = argparse.ArgumentParser(description="黑胶婚礼致谢的材料清单。不直接导出视频。")
-    parser.add_argument("command", choices=("decide", "manifest", "write-test-tone"))
+    parser.add_argument("command", choices=("decide", "manifest", "write-test-tone", "extract"))
+    parser.add_argument("--video", type=Path)
     parser.add_argument("--state", type=Path)
     parser.add_argument("--config", type=Path)
     parser.add_argument("--out", type=Path)
@@ -516,6 +616,12 @@ def main():
             if not args.state:
                 raise GateError("decide 需要 --state")
             print(json.dumps(decide(_read_json(args.state)), ensure_ascii=False))
+            return
+        if args.command == "extract":
+            if not args.state or not args.video or not args.dest:
+                raise GateError("extract 需要 --state --video --dest")
+            payload = extract_user_audio(args.video, args.dest, _read_json(args.state).get("utterance") or "")
+            print(json.dumps(payload, ensure_ascii=False))
             return
         if args.command == "write-test-tone":
             if not args.state or not args.dest:

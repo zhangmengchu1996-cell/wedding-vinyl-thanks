@@ -36,6 +36,9 @@ def build(dest, skill, extra=()):
         raise SystemExit("压缩包根目录没有直接放 SKILL.md")
     if any(name.startswith(("examples/", "scripts/test_", "scripts/accept_")) for name in names):
         raise SystemExit("安装包混入了开发者示例或测试脚本")
+    audio_suffixes = {".m4a", ".mp3", ".wav", ".aac", ".flac", ".ogg"}
+    if any(Path(name).suffix.lower() in audio_suffixes for name in names):
+        raise SystemExit("安装包不应包含音频。第三方歌曲和测试合成音都不要打进去。")
     return dest
 
 

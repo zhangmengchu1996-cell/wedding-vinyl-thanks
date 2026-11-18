@@ -6,9 +6,11 @@ import hashlib, json, subprocess, sys, tempfile, unittest, zipfile
 from pathlib import Path
 
 from gate import (
+    ORIGINAL_REFERENCE,
     GateError,
     build_manifest,
     decide,
+    extract_user_audio,
     filter_file_option,
     is_vague_request,
     write_test_tone,
@@ -104,11 +106,15 @@ class DecisionTests(unittest.TestCase):
         self.assertFalse(decision["render"])
 
     def test_photos_and_copy_without_music_asks_for_bgm(self):
-        decision = decide(full_state(audio=False, audio_label=""))
+        decision = decide(full_state(utterance="照片和文字都齐了", audio=False, audio_label=""))
         self.assertEqual(decision["action"], "ask_audio")
-        self.assertIn("不要音乐", decision["tell_user"])
-        self.assertNotIn("测试音", decision["tell_user"])
+        self.assertIn("原片同款", decision["tell_user"])
+        self.assertIn("自己选歌", decision["tell_user"])
+        self.assertIn("明确静音", decision["tell_user"])
+        self.assertIn(ORIGINAL_REFERENCE, decision["tell_user"])
+        self.assertIn("包里没有这首歌", decision["tell_user"])
         self.assertFalse(decision["render"])
+        self.assertFalse(decision["offer_choice_menu"])
 
     def test_complete_material_waits_for_confirmation(self):
         waiting = decide(full_state())
@@ -166,6 +172,67 @@ class DecisionTests(unittest.TestCase):
         ))
         self.assertEqual(agreed["action"], "render_synthetic")
         self.assertIn("不是你的歌曲", agreed["summary"])
+
+    def test_original_choice_without_a_file_cannot_render(self):
+        decision = decide(full_state(
+            utterance="用原片同款",
+            music_choice="原片同款",
+            audio=False,
+            audio_label="",
+            confirmed=True,
+        ))
+        self.assertEqual(decision["action"], "ask_original_file")
+        self.assertFalse(decision["render"])
+        self.assertIn("不会去网上找", decision["tell_user"])
+        self.assertNotIn("http", decision["tell_user"])
+        self.assertIsNone(decision.get("source_video"))
+
+    def test_supplied_audio_is_reused_and_named_in_the_summary(self):
+        decision = decide(full_state(utterance="就用我发的 march.m4a，原片同款", confirmed=True))
+        self.assertEqual(decision["action"], "render")
+        self.assertIn("音乐文件：march.m4a", decision["summary"])
+        self.assertIn(ORIGINAL_REFERENCE, decision["summary"])
+        self.assertNotEqual(decision["summary"].strip(), ORIGINAL_REFERENCE)
+
+    def test_other_song_asks_which_piece(self):
+        decision = decide(full_state(utterance="我想用别的歌，不是这首", audio=False, audio_label=""))
+        self.assertEqual(decision["action"], "ask_audio")
+        self.assertIn("哪一首", decision["tell_user"])
+        self.assertFalse(decision["render"])
+
+    def test_extract_requires_consent_and_keeps_the_whole_track(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            clip = directory / "user-video.mp4"
+            silent = directory / "no-audio.mp4"
+            dest = directory / "taken.m4a"
+            ffmpeg(
+                "-f", "lavfi", "-i", "color=c=black:s=64x64:d=1",
+                "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+                "-shortest", "-c:v", "libx264", "-c:a", "aac", str(clip),
+            )
+            ffmpeg("-f", "lavfi", "-i", "color=c=black:s=64x64:d=1", "-c:v", "libx264", str(silent))
+            with self.assertRaises(GateError) as missing_consent:
+                extract_user_audio(clip, dest, "用原片同款")
+            self.assertIn("不会自动获得歌曲版权", str(missing_consent.exception))
+            with self.assertRaises(GateError) as no_track:
+                extract_user_audio(silent, dest, "同意提取")
+            self.assertIn("没有音轨", str(no_track.exception))
+            self.assertIn("没有改成静音", str(no_track.exception))
+            with self.assertRaises(GateError) as packaged:
+                extract_user_audio(ROOT / "assets" / "stars.mov", dest, "同意提取")
+            self.assertIn("不能从技能包", str(packaged.exception))
+            taken = extract_user_audio(clip, dest, "我有权使用这段声音，同意提取")
+            self.assertIn("整条音轨", taken["note"])
+            self.assertIn("不构成歌曲授权", taken["note"])
+            self.assertNotIn("纯净", taken["note"])
+            self.assertNotIn("无人声", taken["note"])
+            probe = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_streams", "-of", "json", taken["path"]],
+                capture_output=True, text=True, check=True,
+            )
+            kinds = [item["codec_type"] for item in json.loads(probe.stdout)["streams"]]
+            self.assertEqual(kinds, ["audio"])
 
     def test_already_installed_does_not_repeat_the_install_line(self):
         decision = decide({"intent": "install", "utterance": "装好了", "already_installed": True})
@@ -431,6 +498,8 @@ class FfmpegAndDocTests(unittest.TestCase):
             self.assertIn("合成测试音", document)
             self.assertIn("不要音乐", document)
             self.assertIn("安全边界", document)
+            self.assertIn("不包括第三方音乐", document)
+            self.assertIn("原片同款", document)
             self.assertNotIn("你挑一个", document)
 
 
@@ -447,6 +516,10 @@ class PackageTests(unittest.TestCase):
                     names = archive.namelist()
                     skill = archive.read("SKILL.md").decode("utf-8")
                     stars = archive.read("assets/stars.mov")
+                    blob = "\n".join(
+                        archive.read(name).decode("utf-8", errors="ignore")
+                        for name in names if name.endswith((".md", ".py"))
+                    )
                 self.assertEqual(names[0], "SKILL.md")
                 self.assertIn(f"name: {skill_name}", skill)
                 self.assertNotIn("examples/", "\n".join(names))
@@ -457,6 +530,11 @@ class PackageTests(unittest.TestCase):
                 self.assertIn("LICENSE", names)
                 self.assertIn("scripts/gate.py", names)
                 self.assertIn("scripts/render.py", names)
+                audio_suffixes = {".m4a", ".mp3", ".wav", ".aac", ".flac", ".ogg"}
+                self.assertFalse(any(Path(name).suffix.lower() in audio_suffixes for name in names))
+                self.assertNotIn("http://", blob.lower())
+                self.assertNotIn("https://music.", blob.lower())
+                self.assertIn("包里没有这首歌", skill)
 
 
 if __name__ == "__main__":
