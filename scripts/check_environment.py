@@ -102,7 +102,7 @@ def check(font=None):
     if errors:
         result["user_message"] = "这台电脑还不能做视频：" + "；".join(errors)
     else:
-        result["user_message"] = "技能已经装好。请发你要放进视频的照片。"
+        result["user_message"] = "运行环境已就绪。"
     result["note"] = "平时只把 user_message 告诉用户。路径和版本留在 technical 里，出错或用户追问再说明。不要为此签名、去隔离或安装软件。"
     return result
 

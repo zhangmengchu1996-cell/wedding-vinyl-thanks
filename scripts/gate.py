@@ -118,10 +118,14 @@ def filter_file_option(major, mode):
     (commit 07407ff, between n8.1 and n9.0); the deprecation text says it is
     equivalent to -/filter_complex. This environment has not executed 9.0.
     """
+    # 6.1 only accepts *_script. 7.1 deprecates -filter_complex_script in favor of
+    # -/filter_complex. 9.0 removes the old option; that removal is not treated
+    # as proven here until a 9.x binary has actually encoded a frame.
+    modern = major >= 7
     if mode == "complex":
-        return "-/filter_complex" if major >= 9 else "-filter_complex_script"
+        return "-/filter_complex" if modern else "-filter_complex_script"
     if mode == "video":
-        return "-/filter:v" if major >= 9 else "-filter_script:v"
+        return "-/filter:v" if modern else "-filter_script:v"
     raise GateError("未知滤镜参数类型")
 
 def silence_allowed(text):

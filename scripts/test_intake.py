@@ -425,8 +425,10 @@ class FileGuardTests(unittest.TestCase):
 class FfmpegAndDocTests(unittest.TestCase):
     def test_filter_option_switches_at_ffmpeg_9(self):
         self.assertEqual(filter_file_option(6, "complex"), "-filter_complex_script")
+        self.assertEqual(filter_file_option(7, "complex"), "-/filter_complex")
         self.assertEqual(filter_file_option(9, "complex"), "-/filter_complex")
         self.assertEqual(filter_file_option(6, "video"), "-filter_script:v")
+        self.assertEqual(filter_file_option(7, "video"), "-/filter:v")
         self.assertEqual(filter_file_option(9, "video"), "-/filter:v")
 
     def test_installed_ffmpeg_accepts_legacy_script_option_only(self):
@@ -443,6 +445,16 @@ class FfmpegAndDocTests(unittest.TestCase):
         self.assertIn("Unrecognized option", modern.stderr)
         version = subprocess.run(["ffmpeg", "-version"], capture_output=True, text=True, check=True)
         self.assertIn("6.1.1", version.stdout.splitlines()[0])
+
+    def test_looping_inputs_are_duration_limited(self):
+        source = (ROOT / "scripts" / "render.py").read_text(encoding="utf-8")
+        compact = source.replace(" ", "").replace("\n", "")
+        self.assertIn('"-stream_loop","-1","-t",dur,"-i","stars.mov"', compact)
+        self.assertNotIn('"-stream_loop","-1","-i"', compact)
+        self.assertNotIn('"-loop","1"', compact)
+        self.assertIn("loop=loop=-1:size=1:start=0", source)
+        self.assertIn("trim=duration=", source)
+        self.assertIn('"-filter_complex_threads","1"', compact)
 
     def test_renderer_does_not_synthesize_audio(self):
         source = (ROOT / "scripts" / "render.py").read_text(encoding="utf-8")
@@ -462,7 +474,7 @@ class FfmpegAndDocTests(unittest.TestCase):
             capture_output=True, text=True,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        self.assertEqual(result.stdout.strip(), "技能已经装好。请发你要放进视频的照片。")
+        self.assertEqual(result.stdout.strip(), "运行环境已就绪。")
         details = subprocess.run(
             [sys.executable, "-X", "utf8", str(ROOT / "scripts" / "check_environment.py"), "--details"],
             capture_output=True, text=True,
@@ -493,6 +505,7 @@ class FfmpegAndDocTests(unittest.TestCase):
         for document in (codex, workbuddy, workflow):
             self.assertIn("给我跑一下", document)
             self.assertIn("技能已经装好。请发你要放进视频的照片。", document)
+            self.assertIn("运行环境已就绪", document)
             self.assertIn("不要给「打兼容补丁", document)
             self.assertIn("不要临时签名", document)
             self.assertIn("合成测试音", document)

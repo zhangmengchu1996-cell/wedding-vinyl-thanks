@@ -4,7 +4,7 @@
 Customer renders require the user's own photos, copy, and either a music file
 or an explicit silent opt-in. Bundled examples stay sample-only.
 """
-import argparse, hashlib, json, math, os, random, shutil, struct, subprocess, sys, zlib
+import argparse, hashlib, json, math, os, random, shutil, struct, subprocess, sys, time, zlib
 from pathlib import Path
 from layout import layout_lines
 from gate import GateError, assert_manifest, ffmpeg_major, filter_file_option
@@ -37,6 +37,60 @@ def require_tool(name):
         return binary(name)
     except ValueError as exc:
         raise MaterialError(str(exc) + "。已停止，没有改跑示例视频。") from exc
+
+def process_rss_kib(pid):
+    try:
+        text = Path(f"/proc/{pid}/status").read_text()
+    except OSError:
+        return 0
+    for line in text.splitlines():
+        if line.startswith("VmRSS:"):
+            return int(line.split()[1])
+    return 0
+
+def run_ffmpeg_bounded(cmd, cwd, log_path, rss_limit_mib):
+    """Run ffmpeg and stop it if resident memory grows without bound."""
+    log_path.write_text("", encoding="utf-8")
+    with log_path.open("a", encoding="utf-8") as log:
+        proc = subprocess.Popen(cmd, cwd=cwd, stdout=log, stderr=log)
+        peak = 0
+        samples = []
+        while proc.poll() is None:
+            current = process_rss_kib(proc.pid)
+            peak = max(peak, current)
+            samples.append(current)
+            if rss_limit_mib and peak > rss_limit_mib * 1024:
+                proc.kill()
+                proc.wait()
+                log.write(f"\n已主动结束 ffmpeg：驻留内存 {peak/1024:.0f} MiB，超过上限 {rss_limit_mib} MiB。\n")
+                log.flush()
+                text = log_path.read_text(encoding="utf-8", errors="replace")
+                log_path.with_name("memory-samples.json").write_text(json.dumps(samples), encoding="utf-8")
+                return proc.returncode, peak, text
+            time.sleep(0.4)
+    text = log_path.read_text(encoding="utf-8", errors="replace")
+    log_path.with_name("memory-samples.json").write_text(json.dumps(samples), encoding="utf-8")
+    return proc.returncode, peak, text
+
+def encode_failure_message(code, peak_kib, log_text, log_path, audio):
+    lines = [line for line in log_text.splitlines() if line.strip() and "deprecated" not in line.lower()]
+    tail = "\n".join(lines[-12:])
+    parts = [f"导出失败，退出码 {code}。"]
+    if code < 0:
+        parts.append(f"ffmpeg 被信号 {-code} 终止。")
+        if -code in (9, 15):
+            parts.append("这通常是内存耗尽后被系统杀掉，成片会停在没有 moov 的 video.partial.mp4，无法播放。")
+    if "已主动结束" in log_text:
+        parts.append("渲染器在内存上限处主动停止，避免整机被内核杀掉。")
+    if peak_kib:
+        parts.append(f"观察到的驻留内存峰值约 {peak_kib/1024:.0f} MiB。")
+    parts.append("没有改成静音，也没有降低分辨率。")
+    if audio:
+        parts.append("配乐仍按原配置处理，没有去掉。")
+    parts.append("日志：" + str(log_path))
+    if tail:
+        parts.append(tail)
+    return "".join(parts)
 
 def run(args,cwd=None):
     r=subprocess.run(args,cwd=cwd,stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
@@ -230,25 +284,37 @@ def _main():
     if a.prepare_only:
         print(json.dumps({"prepared":str(out),"duration":duration,"silent":audio is None,"hold_seconds":cfg["hold_seconds"]},ensure_ascii=False))
         return
-    ff=binary("ffmpeg");cmd=[ff,"-hide_banner","-loglevel","warning","-filter_complex_threads","2"]
-    for f in ["background.png","ring.png","text.png"]+[f"photo{i}.png" for i in range(len(photos))]+["wave.png"]:cmd+=["-loop","1","-framerate","30","-i",f]
-    cmd+=["-stream_loop","-1","-i","stars.mov"]
-    if audio:cmd+=["-stream_loop","-1","-i",str(audio)]
-    graph=["[1:v]format=rgba,rotate='0.523599*sin(2*PI*t/16)':c=none:ow=800:oh=800[ring]","[0:v][ring]overlay=110:140[b0]"]
+    ff=binary("ffmpeg");cmd=[ff,"-hide_banner","-loglevel","warning","-filter_complex_threads","1"]
+    # Still images are one frame each. Repeating them with -loop 1 makes
+    # FFmpeg 7.1 keep a copy of every generated frame and the process is
+    # OOM-killed. The loop filter with size=1 repeats the decoded frame on
+    # demand, and trim stops it at the video length. Stars and audio are
+    # real streams: -stream_loop -1 is paired with an input -t so it cannot
+    # run on forever.
+    dur=str(duration)
+    stills=["background.png","ring.png","text.png"]+[f"photo{i}.png" for i in range(len(photos))]+["wave.png"]
+    for name in stills:
+        cmd+=["-i", name]
+    cmd+=["-stream_loop","-1","-t",dur,"-i","stars.mov"]
+    if audio:cmd+=["-stream_loop","-1","-t",dur,"-i",str(audio)]
+    graph=[f"[{i}:v]loop=loop=-1:size=1:start=0,trim=duration={duration},setpts=PTS-STARTPTS,fps=30[still{i}]" for i in range(len(stills))]
+    stars_index=len(stills)
+    graph.append(f"[{stars_index}:v]trim=duration={duration},setpts=PTS-STARTPTS,fps=30[starsrc]")
+    graph += [f"[still1]format=rgba,rotate='0.523599*sin(2*PI*t/16)':c=none:ow=800:oh=800[ring]","[still0][ring]overlay=110:140[b0]"]
     last="b0"
     for i in range(len(photos)):
         start=i*duration/len(photos);end=(i+1)*duration/len(photos)
-        graph.append(f"[{last}][{i+3}:v]overlay=230:260:enable='gte(t,{start})*lt(t,{end})'[b{i+1}]");last=f"b{i+1}"
+        graph.append(f"[{last}][still{i+3}]overlay=230:260:enable='gte(t,{start})*lt(t,{end})'[b{i+1}]");last=f"b{i+1}"
     effects=cfg["effects"]
-    wave_index=len(photos)+3;stars_index=len(photos)+4
-    graph += [f"[{stars_index}:v]format=rgba,colorchannelmixer=aa={effects['stars_opacity']}[stars]",
+    wave_label=f"still{len(photos)+3}"
+    graph += [f"[starsrc]format=rgba,colorchannelmixer=aa={effects['stars_opacity']}[stars]",
               f"[{last}][stars]overlay=0:0[starred]",
-              f"[{wave_index}:v]format=rgba,colorchannelmixer=aa={effects['wave_opacity']}[wave]",
+              f"[{wave_label}]format=rgba,colorchannelmixer=aa={effects['wave_opacity']}[wave]",
               "[starred][wave]overlay=1040:390[decorated]",
               "color=black@0.0:s=820x900:r=30,format=rgba[panel]",
-              f"[panel][2:v]overlay=x=0:y='-{travel}*min(1,max(0,(t-8)/{duration-14}))':shortest=1:format=auto[pane]",
+              f"[panel][still2]overlay=x=0:y='-{travel}*min(1,max(0,(t-8)/{duration-14}))':shortest=1:format=auto[pane]",
               f"[decorated][pane]overlay=1040:90,scale={a.width}:{a.width*9//16},format=yuv420p[v]"]
-    if audio:graph.append(f"[{len(photos)+5}:a]afade=t=in:d=1,afade=t=out:st={duration-3}:d=3[a]")
+    if audio:graph.append(f"[{stars_index+1}:a]afade=t=in:d=1,afade=t=out:st={duration-3}:d=3[a]")
     save_text(out/"render.filters",";\n".join(graph))
     major, version_line = ffmpeg_major(ff)
     preferred = filter_file_option(major, "complex")
@@ -257,22 +323,22 @@ def _main():
     if audio: tail += ["-map", "[a]", "-c:a", "aac", "-b:a", "192k"]
     tail += ["-t", str(duration), "-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-threads", "4", "-movflags", "+faststart", "video.partial.mp4"]
     saved = None
+    rss_limit = int(os.environ.get("WEDDING_VINYL_RSS_LIMIT_MIB", "3072") or "3072")
+    peak_kib = 0
     for option in options:
         full = cmd + [option, "render.filters"] + tail
         save_text(out/"command.json", json.dumps(full, ensure_ascii=False, indent=2))
         save_text(out/"ffmpeg-version.txt", version_line + "\nfilter_option=" + option + "\n")
-        with (out/"render.log").open("w") as log:
-            result = subprocess.run(full, cwd=out, stdout=log, stderr=log)
-        if result.returncode == 0:
+        code, peak_kib, log_text = run_ffmpeg_bounded(full, out, out/"render.log", rss_limit)
+        save_text(out/"memory.json", json.dumps({"peak_rss_kib": peak_kib, "rss_limit_mib": rss_limit, "returncode": code}, ensure_ascii=False, indent=2))
+        if code == 0:
             saved = full
             break
-        log_text = (out/"render.log").read_text(encoding="utf-8", errors="replace")
         if "Unrecognized option" in log_text or "Option not found" in log_text:
             continue
-        hint = "配乐处理失败，没有去掉音乐继续导出。" if audio else ""
-        raise RuntimeError("导出失败，没有改成静音，也没有换成示例素材。" + hint + "请查看日志：" + str(out/"render.log"))
+        raise RuntimeError(encode_failure_message(code, peak_kib, log_text, out/"render.log", audio))
     if saved is None:
-        raise RuntimeError("导出失败，当前 FFmpeg 不接受滤镜文件参数。请查看日志：" + str(out/"render.log"))
+        raise RuntimeError("导出失败，当前 FFmpeg 不接受滤镜文件参数。没有改成静音，也没有降低分辨率。日志：" + str(out/"render.log"))
     meta=json.loads(run([binary("ffprobe"),"-v","error","-show_streams","-show_format","-of","json",str(out/"video.partial.mp4")]))
     v=next(s for s in meta["streams"] if s["codec_type"]=="video")
     if v["width"]!=a.width or v["height"]!=a.width*9//16:
