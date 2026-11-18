@@ -1,57 +1,51 @@
 #!/usr/bin/env python3
-"""Build a skill zip whose root contains SKILL.md, with no extra wrapper folder."""
+"""Build the Codex and WorkBuddy zips. Each archive root is SKILL.md."""
 import sys, zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-TOP_FILES = ("SKILL.md", "README.md", "LICENSE")
-PACK_DIRS = ("assets", "examples", "references", "scripts")
+SHARED = [
+    "LICENSE",
+    "references/workflow.md",
+    "references/config.md",
+    "references/effects.md",
+    "scripts/render.py",
+    "scripts/layout.py",
+    "scripts/gate.py",
+    "scripts/check_environment.py",
+    "assets/record.png",
+    "assets/stars.mov",
+    "assets/wave.png",
+]
 
 
-def iter_skill_files(root=ROOT):
-    files = []
-    for name in TOP_FILES:
-        path = root / name
-        if not path.is_file():
-            raise SystemExit(f"缺少 {name}，不能打包")
-        files.append(path)
-    for dirname in PACK_DIRS:
-        base = root / dirname
-        if not base.is_dir():
-            raise SystemExit(f"缺少 {dirname}，不能打包")
-        for path in sorted(base.rglob("*")):
-            if not path.is_file():
-                continue
-            relative = path.relative_to(root).as_posix()
-            if "/__pycache__/" in f"/{relative}/" or relative.endswith(".pyc"):
-                continue
-            if relative.startswith("examples/output/"):
-                continue
-            if path.name.endswith(".partial.mp4"):
-                continue
-            files.append(path)
-    return files
-
-
-def build_zip(dest, root=ROOT):
+def build(dest, skill, extra=()):
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
-    files = iter_skill_files(root)
+    files = [Path(skill)] + [ROOT / item for item in SHARED] + [ROOT / item for item in extra]
+    missing = [str(path) for path in files if not path.is_file()]
+    if missing:
+        raise SystemExit("缺少文件：" + "、".join(missing))
     with zipfile.ZipFile(dest, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        for path in files:
-            archive.write(path, path.relative_to(root).as_posix())
+        archive.write(skill, "SKILL.md")
+        for path in files[1:]:
+            archive.write(path, path.relative_to(ROOT).as_posix())
+    with zipfile.ZipFile(dest) as archive:
+        names = archive.namelist()
+    if names[0] != "SKILL.md":
+        raise SystemExit("压缩包根目录没有直接放 SKILL.md")
+    if any(name.startswith(("examples/", "scripts/test_", "scripts/accept_")) for name in names):
+        raise SystemExit("安装包混入了开发者示例或测试脚本")
     return dest
 
 
 def main():
-    if len(sys.argv) != 2:
-        raise SystemExit("用法：python3 scripts/package_skill.py 输出.zip")
-    dest = build_zip(sys.argv[1])
-    with zipfile.ZipFile(dest) as archive:
-        names = archive.namelist()
-    if "SKILL.md" not in names or names[0] != "SKILL.md":
-        raise SystemExit("压缩包根目录没有直接放 SKILL.md")
-    print(dest)
+    if len(sys.argv) != 3:
+        raise SystemExit("用法：python3 scripts/package_skill.py Codex输出.zip WorkBuddy输出.zip")
+    codex = build(sys.argv[1], ROOT / "SKILL.md", ["README.md"])
+    workbuddy = build(sys.argv[2], ROOT / "packaging" / "workbuddy" / "SKILL.md")
+    print(codex)
+    print(workbuddy)
 
 
 if __name__ == "__main__":

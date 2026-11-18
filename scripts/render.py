@@ -7,11 +7,9 @@ or an explicit silent opt-in. Bundled examples stay sample-only.
 import argparse, hashlib, json, math, os, random, shutil, struct, subprocess, sys, zlib
 from pathlib import Path
 from layout import layout_lines
+from gate import GateError, assert_manifest, ffmpeg_major, filter_file_option
 
 ROOT = Path(__file__).resolve().parent.parent
-EXAMPLES = ROOT / "examples"
-SAMPLE_COUPLE = "新郎 张三  &  新娘 李四"
-SAMPLE_GUESTS = ("王小明", "赵小红", "陈大伟", "刘芳", "周杰", "吴倩")
 
 class MaterialError(RuntimeError):
     """Stop. Do not substitute example media, a generated tone, or silence."""
@@ -45,70 +43,28 @@ def run(args,cwd=None):
     if r.returncode:raise RuntimeError(r.stderr[-6000:])
     return r.stdout
 
+def run_with_filter_file(ff, prefix, suffix, mode, filename, cwd=None):
+    """Load an unchanged filter graph. Prefer the option this FFmpeg actually accepts."""
+    major, _version = ffmpeg_major(ff)
+    preferred = filter_file_option(major, mode)
+    legacy = "-filter_complex_script" if mode == "complex" else "-filter_script:v"
+    modern = "-/filter_complex" if mode == "complex" else "-/filter:v"
+    options = [preferred] + [item for item in (legacy, modern) if item != preferred]
+    last = ""
+    used = preferred
+    for option in options:
+        result = subprocess.run(prefix + [option, filename] + suffix, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        used = option
+        if result.returncode == 0:
+            return result.stdout, used
+        last = result.stderr or ""
+        if "Unrecognized option" in last or "Option not found" in last:
+            continue
+        raise RuntimeError(last[-6000:])
+    raise RuntimeError(last[-6000:] or "滤镜文件参数无法使用")
+
 def sha256_file(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
-
-def inside(path, parent):
-    try:
-        path.resolve().relative_to(parent.resolve())
-        return True
-    except ValueError:
-        return False
-
-def bundled_hashes():
-    photos=set()
-    photo_dir=EXAMPLES / "photos"
-    if photo_dir.is_dir():
-        for item in photo_dir.iterdir():
-            if item.is_file():
-                photos.add(sha256_file(item))
-    music=EXAMPLES / "music.m4a"
-    return photos, (sha256_file(music) if music.is_file() else None)
-
-def sample_reasons(cfg, config_path, photos, audio):
-    """Reasons this render is using developer sample content. Empty means customer content."""
-    reasons=[]
-    example_cfg=EXAMPLES / "config.example.json"
-    if example_cfg.is_file() and Path(config_path).resolve()==example_cfg.resolve():
-        reasons.append("配置是 examples/config.example.json")
-    photo_hashes, music_hash=bundled_hashes()
-    for photo in photos:
-        if inside(photo, EXAMPLES) or sha256_file(photo) in photo_hashes:
-            reasons.append("照片使用了技能包示例占位图：" + Path(photo).name)
-    if audio is not None and (inside(audio, EXAMPLES) or (music_hash and sha256_file(audio)==music_hash)):
-        reasons.append("配乐使用了技能包示例音乐")
-    texts=[]; guests=[]
-    for row in cfg.get("lines") or []:
-        if isinstance(row, str):
-            texts.append(row)
-        elif isinstance(row, dict):
-            if isinstance(row.get("text"), str):
-                texts.append(row["text"])
-            if isinstance(row.get("names"), list):
-                guests.extend(row["names"])
-    if SAMPLE_COUPLE in texts and all(name in guests for name in SAMPLE_GUESTS):
-        reasons.append("文案使用了示例化名（张三、李四和示例亲友名单）")
-    unique=[]
-    for reason in reasons:
-        if reason not in unique:
-            unique.append(reason)
-    return unique
-
-def validate_sample_use(reasons, sample_flag, accept_sample):
-    if sample_flag is not True and sample_flag is not False:
-        raise MaterialError("sample 只能是 true 或 false。客户视频不要写 sample。")
-    if reasons and not (sample_flag is True and accept_sample):
-        detail="；".join(reasons)
-        raise MaterialError(
-            "检测到技能包自带的示例内容，不能当作客户成片：" + detail
-            + "。已停止，没有导出，也没有改成静音。"
-            + "只有用户明确要求演示时，配置写 \"sample\": true，并且命令行加上 --accept-sample。"
-        )
-    if (sample_flag is True or accept_sample) and not reasons:
-        raise MaterialError(
-            "配置标了示例或带了 --accept-sample，但这份材料不是技能包示例。"
-            + "客户视频请去掉 sample 和 --accept-sample。"
-        )
 
 def resolve_audio(cfg, base, probe):
     """Return a music file, or None only when the user explicitly opted into silence."""
@@ -151,21 +107,7 @@ def resolve_audio(cfg, base, probe):
         raise MaterialError(f"配乐没有音频轨道：{audio}。已停止，没有改成静音。")
     return audio
 
-def check_deps(font_arg):
-    ff=require_tool("ffmpeg")
-    require_tool("ffprobe")
-    version=run([ff, "-version"]).splitlines()[0]
-    info={"dependencies_ok": True, "ffmpeg": version, "ffprobe": True, "rendered": False}
-    default=Path("/System/Library/Fonts/Supplemental/Songti.ttc")
-    info["default_font_present"]=default.is_file()
-    if font_arg:
-        font=Path(font_arg).expanduser()
-        if not font.is_file():
-            raise MaterialError(f"字体不存在：{font}。已停止，没有改用示例视频。")
-        info["font"]=str(font.resolve())
-    return info
-
-def prepare(config, out, accept_sample=False):
+def prepare(config, out):
     cfg=json.loads(Path(config).read_text(encoding="utf-8"));base=Path(config).parent
     if not cfg.get("photos") or not cfg.get("lines"):
         raise MaterialError("缺少照片或文字。已停止，没有用示例内容补上。")
@@ -187,9 +129,6 @@ def prepare(config, out, accept_sample=False):
                 raise MaterialError(k+" 需在 0 至 1 之间")
         photos.append(p)
     audio=resolve_audio(cfg, base, probe)
-    sample_flag=cfg["sample"] if "sample" in cfg else False
-    reasons=sample_reasons(cfg, Path(config), photos, audio)
-    validate_sample_use(reasons, sample_flag, accept_sample)
     try:
         lines=layout_lines(cfg["lines"])
     except ValueError as exc:
@@ -216,9 +155,9 @@ def prepare(config, out, accept_sample=False):
     cfg["font"]=str(font)
     cfg["audio"]=str(audio) if audio else None
     cfg["silent"]=audio is None
-    cfg["sample"]=bool(reasons)
-    cfg["accept_sample"]=bool(accept_sample)
     cfg["duration"]=duration
+    cfg["hold_seconds"]=6
+    cfg["scroll_ends_at"]=round(duration - 6, 3)
     save_text(out/"config.snapshot.json",json.dumps(cfg,ensure_ascii=False,indent=2))
     filters=[];timings=[]
     for i,(text,heading,size) in enumerate(lines):
@@ -229,7 +168,14 @@ def prepare(config, out, accept_sample=False):
             leave=min(duration,(i*52+25+50)/speed+8) if speed else duration
             timings.append({"text":text,"visible_from":round(enter,2),"visible_until":round(leave,2)})
     save_text(out/"text.filters",",".join(filters))
-    run([ff,"-v","error","-f","lavfi","-i",f"color=c=black@0.0:s=820x{height}:r=1,format=rgba","-filter_script:v","text.filters","-frames:v","1","-threads","1","text.png"],out)
+    run_with_filter_file(
+        ff,
+        [ff,"-v","error","-f","lavfi","-i",f"color=c=black@0.0:s=820x{height}:r=1,format=rgba"],
+        ["-frames:v","1","-threads","1","text.png"],
+        "video",
+        "text.filters",
+        out,
+    )
     assets=ROOT / "assets"
     for name in ("record.png","wave.png","stars.mov"):
         source=assets/name
@@ -251,7 +197,7 @@ def prepare(config, out, accept_sample=False):
 def main():
     try:
         _main()
-    except MaterialError as exc:
+    except (MaterialError, GateError) as exc:
         print("已停止："+str(exc), file=sys.stderr)
         raise SystemExit(1)
     except RuntimeError as exc:
@@ -262,30 +208,32 @@ def _main():
     p=argparse.ArgumentParser(description="黑胶婚礼致谢渲染。安装技能或检查依赖不会导出示例视频。")
     p.add_argument("config", nargs="?", type=Path, help="客户自己的配置 JSON。不要把示例配置当作客户成片。")
     p.add_argument("--out", type=Path, help="新的输出目录，不能已存在")
-    p.add_argument("--prepare-only", action="store_true", help="只准备版式，不导出 MP4")
-    p.add_argument("--width", type=int, choices=[960,1920], default=1920, help="1920 为正式导出，960 仅当用户要求预览")
+    p.add_argument("--manifest", type=Path, help="gate.py 写出的已确认清单")
+    p.add_argument("--prepare-only", action="store_true", help="只准备版式，不导出 MP4；仍需要已确认清单")
+    p.add_argument("--width", type=int, choices=[960,1920], default=1920, help="1920 为正式导出，960 仅当用户明确要求预览")
     p.add_argument("--check-deps", action="store_true", help="只检查 FFmpeg/FFprobe，不读取配置、不渲染")
     p.add_argument("--font", type=Path, help="配合 --check-deps，检查字体文件是否存在")
-    p.add_argument("--accept-sample", action="store_true", help="仅当用户明确要求演示时，才允许导出示例素材")
     a=p.parse_args()
     if a.check_deps:
-        if a.config or a.out or a.prepare_only or a.accept_sample:
-            raise MaterialError("检查依赖时不要提供配置、输出目录或示例参数，也不会渲染。")
-        print(json.dumps(check_deps(a.font), ensure_ascii=False))
+        if a.config or a.out or a.prepare_only or a.manifest:
+            raise MaterialError("检查依赖时不要提供配置或输出目录，也不会渲染。")
+        from check_environment import check
+        print(json.dumps(check(str(a.font) if a.font else None), ensure_ascii=False))
         return
     if a.font:
         raise MaterialError("渲染时请把字体写进配置的 font。--font 只配合 --check-deps，用来检查字体在不在。")
-    if not a.config or not a.out:
-        raise MaterialError("请提供客户配置和 --out。仅安装或检查依赖时不要渲染，也不要改跑示例配置。")
-    out=a.out.resolve();cfg,duration,travel,photos,audio=prepare(a.config.resolve(),out,accept_sample=a.accept_sample)
+    if not a.config or not a.out or not a.manifest:
+        raise MaterialError("请提供客户配置、已确认清单和 --out。安装或「跑一下」不会直接导出。")
+    out=a.out.resolve()
+    _manifest, _photos, _kind, _audio = assert_manifest(a.manifest, a.config.resolve(), out, a.width)
+    cfg,duration,travel,photos,audio=prepare(a.config.resolve(),out)
     if a.prepare_only:
-        print(json.dumps({"prepared":str(out),"duration":duration,"silent":audio is None,"sample":cfg["sample"]},ensure_ascii=False))
+        print(json.dumps({"prepared":str(out),"duration":duration,"silent":audio is None,"hold_seconds":cfg["hold_seconds"]},ensure_ascii=False))
         return
-    ff=binary("ffmpeg");cmd=[ff,"-hide_banner","-loglevel","warning","-filter_complex_threads","1"]
-    dur=str(duration)
-    for f in ["background.png","ring.png","text.png"]+[f"photo{i}.png" for i in range(len(photos))]+["wave.png"]:cmd+=["-loop","1","-framerate","30","-t",dur,"-i",f]
-    cmd+=["-stream_loop","-1","-t",dur,"-i","stars.mov"]
-    if audio:cmd+=["-stream_loop","-1","-t",dur,"-i",str(audio)]
+    ff=binary("ffmpeg");cmd=[ff,"-hide_banner","-loglevel","warning","-filter_complex_threads","2"]
+    for f in ["background.png","ring.png","text.png"]+[f"photo{i}.png" for i in range(len(photos))]+["wave.png"]:cmd+=["-loop","1","-framerate","30","-i",f]
+    cmd+=["-stream_loop","-1","-i","stars.mov"]
+    if audio:cmd+=["-stream_loop","-1","-i",str(audio)]
     graph=["[1:v]format=rgba,rotate='0.523599*sin(2*PI*t/16)':c=none:ow=800:oh=800[ring]","[0:v][ring]overlay=110:140[b0]"]
     last="b0"
     for i in range(len(photos)):
@@ -302,15 +250,29 @@ def _main():
               f"[decorated][pane]overlay=1040:90,scale={a.width}:{a.width*9//16},format=yuv420p[v]"]
     if audio:graph.append(f"[{len(photos)+5}:a]afade=t=in:d=1,afade=t=out:st={duration-3}:d=3[a]")
     save_text(out/"render.filters",";\n".join(graph))
-    cmd+=["-filter_complex_script","render.filters","-map","[v]"]
-    if audio:cmd+=["-map","[a]","-c:a","aac","-b:a","192k"]
-    cmd+=["-t",str(duration),"-r","30","-c:v","libx264","-preset","veryfast","-crf","20","-threads","4","-movflags","+faststart","video.partial.mp4"]
-    save_text(out/"command.json",json.dumps(cmd,ensure_ascii=False,indent=2))
-    with (out/"render.log").open("w") as log:
-        r=subprocess.run(cmd,cwd=out,stdout=log,stderr=log)
-    if r.returncode:
-        hint="配乐处理失败，没有去掉音乐继续导出。" if audio else ""
-        raise RuntimeError("导出失败，没有改成静音，也没有换成示例素材。"+hint+"请查看日志："+str(out/"render.log"))
+    major, version_line = ffmpeg_major(ff)
+    preferred = filter_file_option(major, "complex")
+    options = [preferred] + [item for item in ("-filter_complex_script", "-/filter_complex") if item != preferred]
+    tail = ["-map", "[v]"]
+    if audio: tail += ["-map", "[a]", "-c:a", "aac", "-b:a", "192k"]
+    tail += ["-t", str(duration), "-r", "30", "-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-threads", "4", "-movflags", "+faststart", "video.partial.mp4"]
+    saved = None
+    for option in options:
+        full = cmd + [option, "render.filters"] + tail
+        save_text(out/"command.json", json.dumps(full, ensure_ascii=False, indent=2))
+        save_text(out/"ffmpeg-version.txt", version_line + "\nfilter_option=" + option + "\n")
+        with (out/"render.log").open("w") as log:
+            result = subprocess.run(full, cwd=out, stdout=log, stderr=log)
+        if result.returncode == 0:
+            saved = full
+            break
+        log_text = (out/"render.log").read_text(encoding="utf-8", errors="replace")
+        if "Unrecognized option" in log_text or "Option not found" in log_text:
+            continue
+        hint = "配乐处理失败，没有去掉音乐继续导出。" if audio else ""
+        raise RuntimeError("导出失败，没有改成静音，也没有换成示例素材。" + hint + "请查看日志：" + str(out/"render.log"))
+    if saved is None:
+        raise RuntimeError("导出失败，当前 FFmpeg 不接受滤镜文件参数。请查看日志：" + str(out/"render.log"))
     meta=json.loads(run([binary("ffprobe"),"-v","error","-show_streams","-show_format","-of","json",str(out/"video.partial.mp4")]))
     v=next(s for s in meta["streams"] if s["codec_type"]=="video")
     if v["width"]!=a.width or v["height"]!=a.width*9//16:
@@ -325,6 +287,6 @@ def _main():
     (out/"video.partial.mp4").rename(out/"video.mp4")
     for label,t in [("start",1),("middle",duration/2),("end",duration-.2)]:
         run([ff,"-v","error","-ss",str(t),"-i",str(out/"video.mp4"),"-frames:v","1","-threads","1",str(out/f"{label}.jpg")])
-    print(json.dumps({"video":str(out/"video.mp4"),"duration":duration,"silent":audio is None,"sample":cfg["sample"]},ensure_ascii=False))
+    print(json.dumps({"video":str(out/"video.mp4"),"duration":duration,"silent":audio is None,"hold_seconds":cfg["hold_seconds"]},ensure_ascii=False))
 
 if __name__=="__main__":main()
