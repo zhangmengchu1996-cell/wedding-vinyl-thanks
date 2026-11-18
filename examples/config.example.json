@@ -1,4 +1,6 @@
 {
+  "title": "开发者示例配置，不是客户成片",
+  "sample": true,
   "duration": 30,
   "photos": [
     {"path": "photos/01.jpg", "focus_x": 0.5, "focus_y": 0.45},
