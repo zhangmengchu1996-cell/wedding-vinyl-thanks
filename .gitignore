@@ -4,4 +4,5 @@ __pycache__/
 .idea/
 .vscode/
 examples/output/
+dist/
 *.partial.mp4

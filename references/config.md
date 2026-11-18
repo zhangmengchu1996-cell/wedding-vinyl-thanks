@@ -1,35 +1,49 @@
 # 配置说明
 
-UTF-8 JSON，相对路径以配置文件目录为准。助手填写，用户无需改配置。
+UTF-8 JSON，相对路径以配置文件目录为准。助手填写，用户不用改配置，也不用自己运行命令。
 
-必需：photos（数组，每项包含path，可选focus_x/focus_y，均为0至1）；lines（逐行内容）。
-可选：duration（最短目标秒数，默认按文字自动计算，至少20秒）；audio（音乐路径或null）；font（本地中文字体路径，默认macOS宋体）；title（备注）；effects（效果强度）。
+客户视频必需：
 
-示例：
+- photos：数组，每项包含 path，可选 focus_x / focus_y，范围 0 至 1。路径必须是用户自己的照片，文件必须真实存在。
+- lines：用户给出的文字。名单用 names 数组，整个人名换行，不猜测、不替换、不去重。
+- audio：用户的音乐文件路径。不能省略。
+
+用户原话明确不要音乐时，才写成 `"audio": null` 和 `"silent": true`。只写 null、留空或整项不写，都会停止，不会自动静音。只写「原片同款」或曲名、却没有音频文件，同样停止。
+
+曲名「五月天《如果我们不曾相遇》」只是同款参考，不是包内文件，也不表示已经获得授权。MIT 许可不包括这首歌或其他第三方音乐。从用户视频提取时，可另写 `audio_from` 为那段视频的文件名；汇总里仍必须出现实际音频文件名，并说明取出的是整条音轨，提取本身不是版权证明。
+
+用户另外明确同意合成测试音时，才使用：
+
 ```json
-{
-  "duration": 30,
-  "photos": [{"path":"photos/01.jpg","focus_x":0.5,"focus_y":0.5}],
-  "font": "/本机中文字体.ttf",
-  "audio": "music.m4a",
-  "effects": {"stars_opacity":0.85,"wave_opacity":0.22},
-  "lines": [
-    {"text":"谢 幕 答 谢","heading":true},
-    {"text":"2026.10.01"},
-    {"text":""},
-    {"text":"新郎 张三  &  新娘 李四"},
-    {"text":"感谢你们，奔赴这场相聚"},
-    {"text":"亲友团","heading":true},
-    {"names":["王小明","赵小红","陈大伟","刘芳"]},
-    {"text":"感谢你们，见证我们的幸福"}
-  ]
-}
+"audio": "synthetic-test-tone.wav",
+"audio_kind": "synthetic-test-tone"
 ```
 
-名单使用names数组，按整个人名换行，顺序与重名保留。“、”分隔的名单须设置name_list=true或先转为names；不对普通正文的顿号自动拆分。无分隔长名单先整理成names。单个人名超过20个全角字符时提示调整称谓，不截断。普通text允许按字换行；heading=true表示金色标题，空text为空行。
+这个文件只能由 `scripts/gate.py write-test-tone` 在同意之后写出，汇总里必须写明它不是客户的歌曲。
 
-长名单自动延长，不超过28像素/秒；开头8秒、结尾6秒停留。音乐缺省静音，有音乐则循环补足并首尾淡入淡出；未做自动卡点或响度归一。
+开发者仓库里的 `examples/` 不是客户默认配置，安装包不包含它。配置不要指向效果素材 `assets/record.png`、`assets/wave.png`、`assets/stars.mov`。
 
-effects两个透明度范围0至1，0关闭，1完全显示，默认均开启。音波为装饰图形。照片直切，唱片轻摆，星芒循环闪烁。所有效果素材随包携带。
+导出前先写清单。清单记录照片和音乐的 SHA-256、用户原话、白话汇总和 FFmpeg 版本。渲染时会重新计算哈希；对不上就停止。助手填写的原话不是安全边界，但缺文件、坏音频、未确认和覆盖旧目录会被脚本拦住。
 
-输出：video.mp4、config.snapshot.json、text-timing.json、sources.json、verification.json及预览图。每次使用新输出目录。
+```bash
+python3 -X utf8 scripts/gate.py manifest --state 状态.json --config 客户配置.json --out 新的输出目录 --manifest 清单.json
+python3 -X utf8 scripts/render.py 客户配置.json --manifest 清单.json --out 新的输出目录
+```
+
+正式宽度是 1920。只有原话里有「预览」才用 `--width 960`。
+
+名单使用 names 数组，按整个人名换行，顺序与重名保留。“、”分隔的名单须设置 name_list=true 或先转为 names。单个人名超过 20 个全角字符时提示调整称谓，不截断。普通 text 允许按字换行。heading=true 表示金色标题。
+
+长名单自动延长，不超过 28 像素/秒。开头约 8 秒，滚动在结束前 6 秒停住，结尾至少停留 6 秒。有音乐则循环补足并首尾淡入淡出。静音只在用户明确不要音乐时出现，星光和音波仍然绘制。
+
+effects 默认 stars_opacity=0.85、wave_opacity=0.22。缺效果素材就停止。
+
+输出目录必须是新的。输出包括 video.mp4、config.snapshot.json、text-timing.json、sources.json、verification.json 和首、中、尾预览图。snapshot 里的 hold_seconds 是 6。
+
+只检查依赖、不导出：
+
+```bash
+python3 -X utf8 scripts/check_environment.py
+```
+
+FFmpeg 6.1 已在本机实际启动。FFmpeg 9.0 移除了 `-filter_complex_script`，脚本会改用 `-/filter_complex` 读取同一份滤镜图。没有 9.0 二进制的环境不能声称已经跑过 9.0。
